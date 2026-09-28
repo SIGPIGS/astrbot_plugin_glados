@@ -1,0 +1,526 @@
+"""AstrBot plugin: scheduled GLaDOS check-in with per-account UMO notifications.
+
+Performs the daily GLaDOS (glados.cloud / railgun.info) check-in for each
+configured account at a fixed hour, then pushes the result to the session
+(UMO) configured for that account. Also exposes a manual trigger command.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
+
+import aiohttp
+
+from astrbot.api import AstrBotConfig, logger, star
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+
+DOMAINS = ("glados.cloud", "railgun.info")
+SITE_COOKIE_KEYS: dict[str, tuple[str, ...]] = {
+    "glados.cloud": ("gld:sess", "gld:sess.sig"),
+    "railgun.info": ("koa:sess", "koa:sess.sig"),
+}
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+)
+PERMISSION_ERROR_HINTS = ("没有权限", "no permission")
+AUTOMATION_ERROR_HINTS = ("automated check-in detected",)
+
+CODE_SUCCESS = 0
+CODE_REPEAT = 1
+CODE_FAILURE = -2
+CODE_AUTOMATION = 4
+
+
+class GladosConfigError(ValueError):
+    """The plugin configuration is structurally invalid."""
+
+
+class GladosApiError(Exception):
+    """A GLaDOS HTTP request failed (network error or non-JSON body)."""
+
+
+@dataclass(frozen=True, slots=True)
+class GladosAccount:
+    """One configured GLaDOS account.
+
+    Attributes:
+        name: Display name used in notifications and logs.
+        cookie: Raw Cookie header value copied from the browser.
+        success_umo: UMO to notify on success (empty disables).
+        failure_umo: UMO to notify on failure (empty disables).
+        sites: Domains whose session-cookie keys are complete in ``cookie``.
+    """
+
+    name: str
+    cookie: str
+    success_umo: str
+    failure_umo: str
+    sites: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class AccountResult:
+    """Outcome of one check-in run for one account.
+
+    Attributes:
+        name: Account display name.
+        ok: Whether the account is checked in today (success or already).
+        repeat: Whether the site reported "already checked in" (code 1).
+        detail: Human-readable summary for notifications.
+    """
+
+    name: str
+    ok: bool
+    repeat: bool
+    detail: str
+
+
+def complete_cookie_sites(cookie: str) -> list[str]:
+    """List domains whose session-cookie keys are present in ``cookie``.
+
+    Args:
+        cookie: Raw Cookie header value.
+
+    Returns:
+        Domains that have a complete session key pair.
+    """
+    keys = {part.split("=", 1)[0].strip() for part in cookie.split(";") if "=" in part}
+    return [
+        domain
+        for domain, required in SITE_COOKIE_KEYS.items()
+        if all(key in keys for key in required)
+    ]
+
+
+def next_run_delay(now: datetime, hour: int) -> float:
+    """Seconds until the next daily run at ``hour``:00 local time.
+
+    Args:
+        now: Current local time.
+        hour: Hour of day (0-23) to run at.
+
+    Returns:
+        Seconds to sleep before the next run.
+    """
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+def load_accounts(raw_accounts: Any) -> list[GladosAccount]:
+    """Validate the ``accounts`` config list into account objects.
+
+    Args:
+        raw_accounts: Value of the ``accounts`` config key.
+
+    Returns:
+        Parsed accounts (possibly with empty ``sites`` on bad cookies).
+
+    Raises:
+        GladosConfigError: If the value is not a list of objects.
+    """
+    if not isinstance(raw_accounts, list):
+        raise GladosConfigError("GLaDOS 账户配置必须是数组")
+    accounts: list[GladosAccount] = []
+    for index, raw in enumerate(raw_accounts, start=1):
+        if not isinstance(raw, dict):
+            raise GladosConfigError(f"GLaDOS 账户 #{index} 配置格式错误")
+        cookie = str(raw.get("cookie") or "").strip()
+        if not cookie:
+            raise GladosConfigError(f"GLaDOS 账户 #{index} 缺少 Cookie")
+        name = str(raw.get("name") or "").strip() or f"账户{index}"
+        sites = tuple(complete_cookie_sites(cookie))
+        if not sites:
+            logger.error(
+                "GLaDOS account '%s' has no complete session cookie pair; "
+                "glados.cloud needs gld:sess/gld:sess.sig and railgun.info "
+                "needs koa:sess/koa:sess.sig. It will fail until the cookie "
+                "is updated.",
+                name,
+            )
+        accounts.append(
+            GladosAccount(
+                name=name,
+                cookie=cookie,
+                success_umo=str(raw.get("success_umo") or "").strip(),
+                failure_umo=str(raw.get("failure_umo") or "").strip(),
+                sites=sites,
+            )
+        )
+    return accounts
+
+
+def describe_site_error(code: Any, message: str) -> str:
+    """Classify one domain's failed check-in into a short reason.
+
+    Args:
+        code: GLaDOS response code.
+        message: GLaDOS response message.
+
+    Returns:
+        A short Chinese reason string.
+    """
+    lowered = (message or "").lower()
+    if code == CODE_AUTOMATION or any(h in lowered for h in AUTOMATION_ERROR_HINTS):
+        return "被反自动化校验拦截（登录设备与 User-Agent 平台不一致）"
+    if code == CODE_FAILURE and any(h in lowered for h in PERMISSION_ERROR_HINTS):
+        return "Cookie 无效、已过期或不属于该站点"
+    return f"code {code}：{message or '无消息字段'}"
+
+
+def format_result(result: AccountResult) -> str:
+    """Render an account result as the notification text.
+
+    Args:
+        result: Check-in outcome for one account.
+
+    Returns:
+        Notification text for the configured UMO.
+    """
+    if result.ok:
+        icon = "☑️" if result.repeat else "✅"
+        title = "今日已签到" if result.repeat else "签到成功"
+        return f"{icon} GLaDOS {title} [{result.name}]\n{result.detail}"
+    return f"❌ GLaDOS 签到失败 [{result.name}]\n{result.detail}"
+
+
+async def glados_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    domain: str,
+    path: str,
+    cookie: str,
+    user_agent: str,
+    timeout: float,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Perform one GLaDOS API request and return the parsed JSON body.
+
+    Request headers and the compact JSON body mirror what the site frontend
+    sends via axios (no Referer, charset-suffixed content type).
+
+    Args:
+        session: Shared aiohttp session.
+        method: HTTP method ("GET" or "POST").
+        domain: GLaDOS domain to talk to.
+        path: API path, e.g. "/api/user/checkin".
+        cookie: Raw Cookie header value.
+        user_agent: User-Agent header value.
+        timeout: Per-request timeout in seconds.
+        json_body: Optional body serialized as compact JSON for POST.
+
+    Returns:
+        Parsed JSON response object.
+
+    Raises:
+        GladosApiError: On network errors, non-200 status, or invalid JSON.
+    """
+    headers = {
+        "origin": f"https://{domain}",
+        "accept": "application/json, text/plain, */*",
+        "user-agent": user_agent,
+        "cookie": cookie,
+    }
+    data = None
+    if json_body is not None:
+        headers["content-type"] = "application/json;charset=UTF-8"
+        data = json.dumps(json_body, separators=(",", ":")).encode()
+
+    url = f"https://{domain}{path}"
+    try:
+        async with session.request(
+            method,
+            url,
+            headers=headers,
+            data=data,
+            timeout=timeout,
+        ) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                raise GladosApiError(f"HTTP {resp.status}：{text[:120]}")
+            return json.loads(text)
+    except GladosApiError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as error:
+        raise GladosApiError(f"网络请求失败：{error}") from error
+
+
+async def run_account_checkin(
+    session: aiohttp.ClientSession,
+    account: GladosAccount,
+    user_agent: str,
+    timeout: float,
+) -> AccountResult:
+    """Check in one account on every domain its cookie can serve.
+
+    The same cookie may hold session pairs for both domains; the account is
+    considered checked in once any domain answers code 0 (success) or 1
+    (already checked in). Status and points are then read from that domain.
+
+    Args:
+        session: Shared aiohttp session.
+        account: Account to check in.
+        user_agent: User-Agent header value.
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        The account result used for logging and notifications.
+    """
+    if not account.sites:
+        return AccountResult(
+            name=account.name,
+            ok=False,
+            repeat=False,
+            detail=(
+                "Cookie 缺少任一站点的完整会话字段：glados.cloud 需要 "
+                "gld:sess 与 gld:sess.sig，railgun.info 需要 koa:sess 与 "
+                "koa:sess.sig。请重新登录并复制完整 Cookie。"
+            ),
+        )
+
+    errors: list[str] = []
+    for domain in account.sites:
+        try:
+            data = await glados_request(
+                session,
+                "POST",
+                domain,
+                "/api/user/checkin",
+                account.cookie,
+                user_agent,
+                timeout,
+                json_body={"token": domain},
+            )
+        except GladosApiError as error:
+            errors.append(f"{domain}：{error}")
+            continue
+
+        code = data.get("code")
+        if code not in (CODE_SUCCESS, CODE_REPEAT):
+            errors.append(
+                f"{domain}：{describe_site_error(code, str(data.get('message', '')))}"
+            )
+            continue
+
+        # Enrich the result with leftDays and total points; failures here do
+        # not turn an accepted check-in into a failure.
+        left_days = None
+        total_points = None
+        try:
+            status_data = await glados_request(
+                session,
+                "GET",
+                domain,
+                "/api/user/status",
+                account.cookie,
+                user_agent,
+                timeout,
+            )
+            raw_days = status_data.get("data", {}).get("leftDays")
+            if raw_days is not None:
+                left_days = int(float(raw_days))
+        except (GladosApiError, TypeError, ValueError):
+            logger.warning(
+                "GLaDOS status query failed for account '%s' on %s",
+                account.name,
+                domain,
+                exc_info=True,
+            )
+        try:
+            points_data = await glados_request(
+                session,
+                "GET",
+                domain,
+                "/api/user/points",
+                account.cookie,
+                user_agent,
+                timeout,
+            )
+            if points_data.get("points") is not None:
+                total_points = int(float(points_data["points"]))
+        except (GladosApiError, TypeError, ValueError):
+            logger.warning(
+                "GLaDOS points query failed for account '%s' on %s",
+                account.name,
+                domain,
+                exc_info=True,
+            )
+
+        info = [f"站点 {domain}"]
+        if code == CODE_SUCCESS:
+            info.append(f"本次获得 {data.get('points', 0)} 积分")
+        if left_days is not None:
+            info.append(f"剩余 {left_days} 天")
+        if total_points is not None:
+            info.append(f"总积分 {total_points}")
+        return AccountResult(
+            name=account.name,
+            ok=True,
+            repeat=code == CODE_REPEAT,
+            detail=" · ".join(info),
+        )
+
+    return AccountResult(
+        name=account.name,
+        ok=False,
+        repeat=False,
+        detail="\n".join(errors),
+    )
+
+
+class GladosPlugin(star.Star):
+    """GLaDOS 每日定时签到。
+
+    在配置的整点对每个账户执行 glados.cloud / railgun.info 签到，
+    并把成功/失败结果推送到账户配置的 UMO。
+    命令：/glados checkin 手动触发一次全部账户签到。
+    """
+
+    def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
+        """Initialize the plugin from AstrBot configuration.
+
+        Args:
+            context: AstrBot plugin context.
+            config: Plugin configuration from the WebUI.
+        """
+        super().__init__(context)
+        self.config = config
+
+        try:
+            checkin_hour = int(config.get("checkin_hour", 9))
+        except (TypeError, ValueError) as error:
+            raise GladosConfigError("每天几点签到必须是整数") from error
+        if not 0 <= checkin_hour <= 23:
+            raise GladosConfigError("每天几点签到必须在 0-23 之间")
+        self.checkin_hour = checkin_hour
+
+        user_agent = str(config.get("user_agent", "")).strip()
+        self.user_agent = user_agent or DEFAULT_USER_AGENT
+
+        try:
+            timeout = float(config.get("request_timeout", 30))
+        except (TypeError, ValueError) as error:
+            raise GladosConfigError("请求超时必须是数字") from error
+        if timeout <= 0:
+            raise GladosConfigError("请求超时必须大于 0")
+        self.timeout = timeout
+
+        self.accounts = load_accounts(config.get("accounts", []))
+        self._running = False
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+        logger.info(
+            "GLaDOS plugin loaded: %d account(s), daily check-in at %02d:00",
+            len(self.accounts),
+            self.checkin_hour,
+        )
+
+    async def terminate(self) -> None:
+        """Stop the scheduler when AstrBot unloads the plugin."""
+        self._scheduler_task.cancel()
+        try:
+            await self._scheduler_task
+        except asyncio.CancelledError:
+            pass
+
+    async def _scheduler_loop(self) -> None:
+        """Sleep until the configured hour and run all check-ins, daily."""
+        while True:
+            delay = next_run_delay(datetime.now(), self.checkin_hour)
+            logger.info(
+                "GLaDOS next check-in in %.0f seconds (%02d:00 local)",
+                delay,
+                self.checkin_hour,
+            )
+            await asyncio.sleep(delay)
+            try:
+                await self.checkin_all()
+            except Exception:
+                logger.exception("GLaDOS scheduled check-in failed")
+
+    async def checkin_all(self) -> list[AccountResult]:
+        """Check in every configured account once and send notifications.
+
+        Returns:
+            Results for all accounts, in configuration order.
+        """
+        results: list[AccountResult] = []
+        if not self.accounts:
+            return results
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            for account in self.accounts:
+                result = await run_account_checkin(
+                    session,
+                    account,
+                    self.user_agent,
+                    self.timeout,
+                )
+                results.append(result)
+                logger.info(
+                    "GLaDOS check-in '%s': %s",
+                    account.name,
+                    "ok" if result.ok else f"failed ({result.detail})",
+                )
+                await self._notify(account, result)
+        return results
+
+    async def _notify(self, account: GladosAccount, result: AccountResult) -> None:
+        """Send one account's result to its configured UMO, if any.
+
+        Args:
+            account: Account that produced the result.
+            result: Check-in outcome to deliver.
+        """
+        umo = account.success_umo if result.ok else account.failure_umo
+        if not umo:
+            return
+        try:
+            sent = await self.context.send_message(
+                umo,
+                MessageChain().message(format_result(result)),
+            )
+        except Exception:
+            logger.warning(
+                "GLaDOS notification to %s failed for account '%s'",
+                umo,
+                account.name,
+                exc_info=True,
+            )
+            return
+        if not sent:
+            logger.warning(
+                "GLaDOS notification UMO %s matched no platform (account '%s')",
+                umo,
+                account.name,
+            )
+
+    @filter.command_group("glados")
+    def glados(self) -> None:
+        """GLaDOS check-in commands."""
+
+    @glados.command("checkin")
+    async def checkin(self, event: AstrMessageEvent):
+        """Run the check-in for every configured account immediately.
+
+        Args:
+            event: Incoming AstrBot message event.
+        """
+        if self._running:
+            yield event.plain_result("GLaDOS 签到正在进行中，请稍后再试。")
+            return
+        self._running = True
+        try:
+            results = await self.checkin_all()
+        finally:
+            self._running = False
+        if not results:
+            yield event.plain_result("没有配置任何 GLaDOS 账户。")
+            return
+        yield event.plain_result(
+            "\n\n".join(format_result(result) for result in results)
+        )

@@ -1,0 +1,7 @@
+name: astrbot_plugin_glados
+display_name: GLaDOS 签到
+desc: 每天定时执行 GLaDOS（glados.cloud / railgun.info）签到，并按账户把成功/失败结果推送到指定会话
+short_desc: GLaDOS 每日定时签到与结果通知
+version: 0.1.0
+author: bowling233
+repo: https://github.com/bowling233/astrbot_plugin_glados
