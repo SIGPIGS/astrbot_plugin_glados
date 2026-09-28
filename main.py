@@ -384,8 +384,8 @@ class GladosPlugin(star.Star):
     """GLaDOS 每日定时签到。
 
     在配置的整点对每个账户执行 glados.cloud / railgun.info 签到，
-    并把成功/失败结果推送到账户配置的 UMO。
-    命令：/glados checkin 手动触发一次全部账户签到。
+    并把结果推送到账户配置的 UMO。
+    命令：/glados checkin 手动签到绑定到当前会话的账户。
     """
 
     def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
@@ -446,17 +446,24 @@ class GladosPlugin(star.Star):
             except Exception:
                 logger.exception("GLaDOS scheduled check-in failed")
 
-    async def checkin_all(self) -> list[AccountResult]:
-        """Check in every configured account once and send notifications.
+    async def checkin_all(
+        self, accounts: list[GladosAccount] | None = None
+    ) -> list[AccountResult]:
+        """Check in the given accounts once and send their notifications.
+
+        Args:
+            accounts: Accounts to check in; defaults to every configured
+                account (used by the daily schedule).
 
         Returns:
-            Results for all accounts, in configuration order.
+            Results for the checked accounts, in the given order.
         """
         results: list[AccountResult] = []
-        if not self.accounts:
+        accounts = accounts if accounts is not None else self.accounts
+        if not accounts:
             return results
         async with aiohttp.ClientSession(trust_env=True) as session:
-            for account in self.accounts:
+            for account in accounts:
                 result = await run_account_checkin(session, account, self.timeout)
                 results.append(result)
                 logger.info(
@@ -499,26 +506,37 @@ class GladosPlugin(star.Star):
 
     @filter.command_group("glados")
     def glados(self) -> None:
-        """GLaDOS check-in commands."""
+        """GLaDOS 签到命令：/glados checkin 签到绑定到当前会话的账户。"""
 
     @glados.command("checkin")
     async def checkin(self, event: AstrMessageEvent):
-        """Run the check-in for every configured account immediately.
+        """Check in the accounts bound to this session's UMO immediately.
+
+        Only accounts whose notify_umo equals this session's UMO are checked
+        in, so a conversation can never trigger or see other accounts.
 
         Args:
             event: Incoming AstrBot message event.
         """
+        bound = [
+            account
+            for account in self.accounts
+            if account.notify_umo == event.unified_msg_origin
+        ]
+        if not bound:
+            yield event.plain_result(
+                "当前会话未绑定任何 GLaDOS 账户。请在插件配置中将账户的"
+                "「签到通知 UMO」设为本会话（可在此会话发送 /sid 获取）。"
+            )
+            return
         if self._running:
             yield event.plain_result("GLaDOS 签到正在进行中，请稍后再试。")
             return
         self._running = True
         try:
-            results = await self.checkin_all()
+            results = await self.checkin_all(bound)
         finally:
             self._running = False
-        if not results:
-            yield event.plain_result("没有配置任何 GLaDOS 账户。")
-            return
         yield event.plain_result(
             "\n\n".join(format_result(result) for result in results)
         )
