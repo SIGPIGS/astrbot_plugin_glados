@@ -447,13 +447,18 @@ class GladosPlugin(star.Star):
                 logger.exception("GLaDOS scheduled check-in failed")
 
     async def checkin_all(
-        self, accounts: list[GladosAccount] | None = None
+        self,
+        accounts: list[GladosAccount] | None = None,
+        notify: bool = True,
     ) -> list[AccountResult]:
-        """Check in the given accounts once and send their notifications.
+        """Check in the given accounts once and optionally send notifications.
 
         Args:
             accounts: Accounts to check in; defaults to every configured
                 account (used by the daily schedule).
+            notify: Whether to push each result to the account's notify_umo.
+                Manual runs disable this because the command reply already
+                carries every bound account's result in the same session.
 
         Returns:
             Results for the checked accounts, in the given order.
@@ -471,7 +476,8 @@ class GladosPlugin(star.Star):
                     account.name,
                     "ok" if result.ok else f"failed ({result.detail})",
                 )
-                await self._notify(account, result)
+                if notify:
+                    await self._notify(account, result)
         return results
 
     async def _notify(self, account: GladosAccount, result: AccountResult) -> None:
@@ -534,7 +540,9 @@ class GladosPlugin(star.Star):
             return
         self._running = True
         try:
-            results = await self.checkin_all(bound)
+            # The reply below already delivers each bound account's result in
+            # this session, so skip the push notifications to avoid duplicates.
+            results = await self.checkin_all(bound, notify=False)
         finally:
             self._running = False
         yield event.plain_result(
