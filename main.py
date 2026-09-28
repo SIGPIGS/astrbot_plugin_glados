@@ -158,6 +158,26 @@ def load_accounts(raw_accounts: Any) -> list[GladosAccount]:
     return accounts
 
 
+def format_traffic(byte_count: int) -> str:
+    """Format a byte count as a human-readable binary-unit string.
+
+    Args:
+        byte_count: Traffic in bytes as reported by /api/user/status.
+
+    Returns:
+        E.g. ``"512 B"``, ``"1.5 KiB"``, ``"259.6 GiB"``.
+    """
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(byte_count)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
 def describe_site_error(code: Any, message: str) -> str:
     """Classify one domain's failed check-in into a short reason.
 
@@ -380,12 +400,115 @@ async def run_account_checkin(
     )
 
 
+async def query_account_status(
+    session: aiohttp.ClientSession,
+    account: GladosAccount,
+    timeout: float,
+) -> AccountResult:
+    """Query one account's detailed status without checking in.
+
+    Reads ``/api/user/status`` (leftDays, used traffic, VIP level, region,
+    port) and ``/api/user/points`` from the first domain that answers with
+    a status payload. Read-only; never sends notifications.
+
+    Args:
+        session: Shared aiohttp session.
+        account: Account to query.
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        The account status used for the /glados status reply.
+    """
+    user_agent = account.user_agent or DEFAULT_USER_AGENT
+    if not account.sites:
+        return AccountResult(
+            name=account.name,
+            ok=False,
+            repeat=False,
+            detail="Cookie 缺少任一站点的完整会话字段，请更新 Cookie 后再查询。",
+        )
+
+    errors: list[str] = []
+    for domain in account.sites:
+        try:
+            status_data = await glados_request(
+                session,
+                "GET",
+                domain,
+                "/api/user/status",
+                account.cookie,
+                user_agent,
+                timeout,
+            )
+            raw_days = status_data.get("data", {}).get("leftDays")
+            if raw_days is None:
+                errors.append(
+                    f"{domain}："
+                    + describe_site_error(
+                        status_data.get("code"),
+                        str(status_data.get("message", "")),
+                    )
+                )
+                continue
+            data = status_data["data"]
+        except (GladosApiError, TypeError, ValueError) as error:
+            errors.append(f"{domain}：{error}")
+            continue
+
+        points = None
+        try:
+            points_data = await glados_request(
+                session,
+                "GET",
+                domain,
+                "/api/user/points",
+                account.cookie,
+                user_agent,
+                timeout,
+            )
+            if points_data.get("points") is not None:
+                points = int(float(points_data["points"]))
+        except (GladosApiError, TypeError, ValueError):
+            logger.warning(
+                "GLaDOS points query failed for account '%s' on %s",
+                account.name,
+                domain,
+                exc_info=True,
+            )
+
+        info = [f"剩余 {int(float(raw_days))} 天"]
+        if data.get("traffic") is not None:
+            info.append(f"已用流量 {format_traffic(int(data['traffic']))}")
+        if data.get("vip") is not None:
+            info.append(f"VIP {data['vip']}")
+        if data.get("region"):
+            info.append(f"区域 {data['region']}")
+        if data.get("port"):
+            info.append(f"端口 {data['port']}")
+        if points is not None:
+            info.append(f"积分 {points}")
+        return AccountResult(
+            name=account.name,
+            ok=True,
+            repeat=False,
+            detail=f"（{domain}）" + " · ".join(info),
+        )
+
+    return AccountResult(
+        name=account.name,
+        ok=False,
+        repeat=False,
+        detail="\n".join(errors),
+    )
+
+
 class GladosPlugin(star.Star):
     """GLaDOS 每日定时签到。
 
     在配置的整点对每个账户执行 glados.cloud / railgun.info 签到，
     并把结果推送到账户配置的 UMO。
-    命令：/glados checkin 手动签到绑定到当前会话的账户。
+    命令：/glados checkin 手动签到绑定到当前会话的账户；
+    /glados status 查询这些账户的剩余天数、流量等状态。
     """
 
     def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
@@ -512,7 +635,7 @@ class GladosPlugin(star.Star):
 
     @filter.command_group("glados")
     def glados(self) -> None:
-        """GLaDOS 签到命令：/glados checkin 签到绑定到当前会话的账户。"""
+        """GLaDOS 签到命令：/glados checkin 手动签到，/glados status 查询状态。"""
 
     @glados.command("checkin")
     async def checkin(self, event: AstrMessageEvent):
@@ -548,3 +671,37 @@ class GladosPlugin(star.Star):
         yield event.plain_result(
             "\n\n".join(format_result(result) for result in results)
         )
+
+    @glados.command("status")
+    async def status(self, event: AstrMessageEvent):
+        """Query the status of the accounts bound to this session's UMO.
+
+        Read-only: shows remaining days, used traffic, VIP level, region,
+        port and points for each bound account; never checks in and never
+        pushes notifications.
+
+        Args:
+            event: Incoming AstrBot message event.
+        """
+        bound = [
+            account
+            for account in self.accounts
+            if account.notify_umo == event.unified_msg_origin
+        ]
+        if not bound:
+            yield event.plain_result(
+                "当前会话未绑定任何 GLaDOS 账户。请在插件配置中将账户的"
+                "「签到通知 UMO」设为本会话（可在此会话发送 /sid 获取）。"
+            )
+            return
+        results: list[AccountResult] = []
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            for account in bound:
+                results.append(
+                    await query_account_status(session, account, self.timeout)
+                )
+        lines = [
+            f"{'📊' if result.ok else '⚠️'} [{result.name}] {result.detail}"
+            for result in results
+        ]
+        yield event.plain_result("\n".join(lines))

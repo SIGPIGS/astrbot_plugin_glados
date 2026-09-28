@@ -228,3 +228,106 @@ async def test_account_user_agent_used_or_default():
     await glados.run_account_checkin(session, account(), 7)
     used = {kwargs["headers"]["user-agent"] for _, _, kwargs in session.requests}
     assert used == {glados.DEFAULT_USER_AGENT}
+
+
+def test_format_traffic():
+    assert glados.format_traffic(512) == "512 B"
+    assert glados.format_traffic(1536) == "1.5 KiB"
+    assert glados.format_traffic(278776393508) == "259.6 GiB"
+    assert glados.format_traffic(3 * 1024**4) == "3.0 TiB"
+
+
+REAL_STATUS_PAYLOAD = {
+    "code": 0,
+    "data": {
+        "traffic": 278776393508,
+        "vip": 31,
+        "region": "us",
+        "port": 183203,
+        "leftDays": "236.0000000000000000",
+    },
+}
+REAL_POINTS_PAYLOAD = {"code": 0, "points": "47.0000000000000000"}
+
+
+def status_routes():
+    return {
+        "https://railgun.info/api/user/status": FakeResponse(
+            payload=REAL_STATUS_PAYLOAD
+        ),
+        "https://railgun.info/api/user/points": FakeResponse(
+            payload=REAL_POINTS_PAYLOAD
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_query_account_status_details():
+    session = FakeSession(status_routes())
+    result = await glados.query_account_status(session, account(), 5)
+    assert result.ok
+    assert "railgun.info" in result.detail
+    assert "剩余 236 天" in result.detail
+    assert "已用流量 259.6 GiB" in result.detail
+    assert "VIP 31" in result.detail
+    assert "区域 us" in result.detail
+    assert "端口 183203" in result.detail
+    assert "积分 47" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_query_account_status_tolerates_missing_fields():
+    routes = status_routes()
+    routes["https://railgun.info/api/user/status"] = FakeResponse(
+        payload={"code": 0, "data": {"leftDays": "3.5"}}
+    )
+    routes["https://railgun.info/api/user/points"] = aiohttp.ClientError("boom")
+    result = await glados.query_account_status(FakeSession(routes), account(), 5)
+    assert result.ok
+    assert "剩余 3 天" in result.detail
+    assert "已用流量" not in result.detail
+    assert "VIP" not in result.detail
+    assert "积分" not in result.detail
+
+
+@pytest.mark.asyncio
+async def test_query_account_status_falls_back_to_second_domain():
+    routes = {
+        "https://glados.cloud/api/user/status": FakeResponse(
+            payload={"code": -2, "message": "没有权限"}
+        ),
+        "https://railgun.info/api/user/status": FakeResponse(
+            payload=REAL_STATUS_PAYLOAD
+        ),
+        "https://railgun.info/api/user/points": FakeResponse(
+            payload=REAL_POINTS_PAYLOAD
+        ),
+    }
+    session = FakeSession(routes)
+    result = await glados.query_account_status(
+        session, account(cookie=BOTH_COOKIE, sites=glados.DOMAINS), 5
+    )
+    assert result.ok
+    assert "剩余 236 天" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_query_account_status_all_fail():
+    routes = {
+        f"https://{domain}/api/user/status": FakeResponse(
+            payload={"code": -2, "message": "没有权限"}
+        )
+        for domain in glados.DOMAINS
+    }
+    result = await glados.query_account_status(
+        FakeSession(routes), account(cookie=BOTH_COOKIE, sites=glados.DOMAINS), 5
+    )
+    assert not result.ok
+    assert result.detail.count("Cookie 无效") == 2
+
+
+@pytest.mark.asyncio
+async def test_query_account_status_incomplete_cookie():
+    result = await glados.query_account_status(FakeSession({}), account(sites=()), 5)
+    assert not result.ok
+    assert "会话字段" in result.detail
