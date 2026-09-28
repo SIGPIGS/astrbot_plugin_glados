@@ -51,17 +51,17 @@ class GladosAccount:
     Attributes:
         name: Display name used in notifications and logs.
         cookie: Raw Cookie header value copied from the browser.
-        user_agent: Per-account User-Agent (empty falls back to the global one).
-        success_umo: UMO to notify on success (empty disables).
-        failure_umo: UMO to notify on failure (empty disables).
+        user_agent: Per-account User-Agent (empty falls back to the built-in
+            default, because GLaDOS checks the platform against the browser
+            the account was logged in from).
+        notify_umo: UMO to receive this account's results (empty disables).
         sites: Domains whose session-cookie keys are complete in ``cookie``.
     """
 
     name: str
     cookie: str
     user_agent: str
-    success_umo: str
-    failure_umo: str
+    notify_umo: str
     sites: tuple[str, ...]
 
 
@@ -151,8 +151,7 @@ def load_accounts(raw_accounts: Any) -> list[GladosAccount]:
                 name=name,
                 cookie=cookie,
                 user_agent=str(raw.get("user_agent") or "").strip(),
-                success_umo=str(raw.get("success_umo") or "").strip(),
-                failure_umo=str(raw.get("failure_umo") or "").strip(),
+                notify_umo=str(raw.get("notify_umo") or "").strip(),
                 sites=sites,
             )
         )
@@ -260,7 +259,6 @@ async def glados_request(
 async def run_account_checkin(
     session: aiohttp.ClientSession,
     account: GladosAccount,
-    user_agent: str,
     timeout: float,
 ) -> AccountResult:
     """Check in one account on every domain its cookie can serve.
@@ -272,7 +270,6 @@ async def run_account_checkin(
     Args:
         session: Shared aiohttp session.
         account: Account to check in.
-        user_agent: Fallback User-Agent when the account has none.
         timeout: Per-request timeout in seconds.
 
     Returns:
@@ -280,7 +277,7 @@ async def run_account_checkin(
     """
     # GLaDOS compares the check-in request's UA platform with the browser
     # the account was logged in from, so the UA must follow the account.
-    user_agent = account.user_agent or user_agent
+    user_agent = account.user_agent or DEFAULT_USER_AGENT
     if not account.sites:
         return AccountResult(
             name=account.name,
@@ -409,9 +406,6 @@ class GladosPlugin(star.Star):
             raise GladosConfigError("每天几点签到必须在 0-23 之间")
         self.checkin_hour = checkin_hour
 
-        user_agent = str(config.get("user_agent", "")).strip()
-        self.user_agent = user_agent or DEFAULT_USER_AGENT
-
         try:
             timeout = float(config.get("request_timeout", 30))
         except (TypeError, ValueError) as error:
@@ -463,12 +457,7 @@ class GladosPlugin(star.Star):
             return results
         async with aiohttp.ClientSession(trust_env=True) as session:
             for account in self.accounts:
-                result = await run_account_checkin(
-                    session,
-                    account,
-                    self.user_agent,
-                    self.timeout,
-                )
+                result = await run_account_checkin(session, account, self.timeout)
                 results.append(result)
                 logger.info(
                     "GLaDOS check-in '%s': %s",
@@ -485,7 +474,7 @@ class GladosPlugin(star.Star):
             account: Account that produced the result.
             result: Check-in outcome to deliver.
         """
-        umo = account.success_umo if result.ok else account.failure_umo
+        umo = account.notify_umo
         if not umo:
             return
         try:

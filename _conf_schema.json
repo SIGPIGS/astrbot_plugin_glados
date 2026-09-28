@@ -5,12 +5,6 @@
     "hint": "0-23 的整点，按 AstrBot 所在时区。插件加载或配置保存后，从下一个该时刻开始执行。",
     "default": 9
   },
-  "user_agent": {
-    "description": "签到请求 User-Agent",
-    "type": "string",
-    "hint": "GLaDOS 会比对「登录浏览器平台」与「签到请求平台」：若签到被判定为自动签到（code 4），请在登录所用浏览器的控制台执行 navigator.userAgent，把完整值粘贴到这里。默认为 macOS Chrome UA（Windows/Linux/iPhone UA 实测会被拦截）。",
-    "default": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-  },
   "request_timeout": {
     "description": "单个请求超时（秒）",
     "type": "int",
@@ -41,19 +35,13 @@
           "user_agent": {
             "description": "该账户的 User-Agent",
             "type": "string",
-            "hint": "GLaDOS 会校验签到请求的平台与登录时浏览器的平台是否一致。请填写登录该账户所用浏览器控制台中 navigator.userAgent 的完整值；留空则使用通用配置的 User-Agent。",
+            "hint": "GLaDOS 会校验签到请求的平台与登录时浏览器的平台是否一致。请填写登录该账户所用浏览器控制台中 navigator.userAgent 的完整值；留空则使用内置默认（macOS Chrome UA）。",
             "default": ""
           },
-          "success_umo": {
-            "description": "签到成功通知 UMO",
+          "notify_umo": {
+            "description": "签到通知 UMO",
             "type": "string",
-            "hint": "签到成功（含当日已签到）时推送结果的会话 UMO，留空不通知。",
-            "default": ""
-          },
-          "failure_umo": {
-            "description": "签到失败通知 UMO",
-            "type": "string",
-            "hint": "签到失败（Cookie 失效、被反自动化拦截、网络错误等）时推送结果的会话 UMO，留空不通知。",
+            "hint": "该账户的签到结果（成功与失败）都推送到这个会话，留空不通知。可在目标会话中发送 /sid 获取 UMO。",
             "default": ""
           }
         }

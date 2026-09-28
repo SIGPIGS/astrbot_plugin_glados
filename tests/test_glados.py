@@ -49,8 +49,7 @@ def account(**overrides):
         "name": "test",
         "cookie": GLD_COOKIE,
         "user_agent": "",
-        "success_umo": "",
-        "failure_umo": "",
+        "notify_umo": "",
         "sites": tuple(glados.complete_cookie_sites(GLD_COOKIE)),
     }
     fields.update(overrides)
@@ -97,6 +96,7 @@ def test_load_accounts_validates_and_defaults():
                 "name": "main",
                 "cookie": GLD_COOKIE,
                 "user_agent": "MyAccountUA",
+                "notify_umo": "napcat:GroupMessage:1",
             },
             {"cookie": BOTH_COOKIE},
         ]
@@ -104,7 +104,9 @@ def test_load_accounts_validates_and_defaults():
     assert [a.name for a in accounts] == ["main", "账户2"]
     assert accounts[0].sites == ("railgun.info",)
     assert accounts[0].user_agent == "MyAccountUA"
+    assert accounts[0].notify_umo == "napcat:GroupMessage:1"
     assert accounts[1].user_agent == ""
+    assert accounts[1].notify_umo == ""
     assert accounts[1].sites == glados.DOMAINS
 
     with pytest.raises(glados.GladosConfigError):
@@ -134,7 +136,7 @@ def test_describe_site_error():
 @pytest.mark.asyncio
 async def test_run_account_checkin_success():
     session = FakeSession(ok_checkin_routes("railgun.info"))
-    result = await glados.run_account_checkin(session, account(), "UA", 5)
+    result = await glados.run_account_checkin(session, account(), 5)
     assert result.ok and not result.repeat
     assert "railgun.info" in result.detail
     assert "获得 5 积分" in result.detail
@@ -145,7 +147,7 @@ async def test_run_account_checkin_success():
 @pytest.mark.asyncio
 async def test_run_account_checkin_repeat():
     session = FakeSession(ok_checkin_routes("railgun.info", code=1))
-    result = await glados.run_account_checkin(session, account(), "UA", 5)
+    result = await glados.run_account_checkin(session, account(), 5)
     assert result.ok and result.repeat
 
 
@@ -157,7 +159,7 @@ async def test_run_account_checkin_falls_back_to_second_domain():
     )
     session = FakeSession(routes)
     result = await glados.run_account_checkin(
-        session, account(cookie=BOTH_COOKIE, sites=glados.DOMAINS), "UA", 5
+        session, account(cookie=BOTH_COOKIE, sites=glados.DOMAINS), 5
     )
     assert result.ok
     # Only the second domain's status/points should have been queried.
@@ -175,7 +177,7 @@ async def test_run_account_checkin_all_sites_fail():
         )
     session = FakeSession(routes)
     result = await glados.run_account_checkin(
-        session, account(cookie=BOTH_COOKIE, sites=glados.DOMAINS), "UA", 5
+        session, account(cookie=BOTH_COOKIE, sites=glados.DOMAINS), 5
     )
     assert not result.ok
     assert result.detail.count("反自动化") == 2
@@ -185,7 +187,7 @@ async def test_run_account_checkin_all_sites_fail():
 async def test_run_account_checkin_network_error_recorded():
     routes = {"https://railgun.info/api/user/checkin": aiohttp.ClientError("boom")}
     session = FakeSession(routes)
-    result = await glados.run_account_checkin(session, account(), "UA", 5)
+    result = await glados.run_account_checkin(session, account(), 5)
     assert not result.ok
     assert "网络请求失败" in result.detail
 
@@ -193,7 +195,7 @@ async def test_run_account_checkin_network_error_recorded():
 @pytest.mark.asyncio
 async def test_run_account_checkin_incomplete_cookie():
     result = await glados.run_account_checkin(
-        FakeSession({}), account(sites=()), "UA", 5
+        FakeSession({}), account(sites=()), 5
     )
     assert not result.ok
     assert "会话字段" in result.detail
@@ -202,7 +204,7 @@ async def test_run_account_checkin_incomplete_cookie():
 @pytest.mark.asyncio
 async def test_request_mirrors_browser_format():
     session = FakeSession(ok_checkin_routes("railgun.info"))
-    await glados.run_account_checkin(session, account(), "MyUA", 7)
+    await glados.run_account_checkin(session, account(user_agent="MyUA"), 7)
     method, url, kwargs = session.requests[0]
     assert method == "POST" and url.endswith("/api/user/checkin")
     headers = kwargs["headers"]
@@ -214,15 +216,15 @@ async def test_request_mirrors_browser_format():
 
 
 @pytest.mark.asyncio
-async def test_account_user_agent_overrides_fallback():
+async def test_account_user_agent_used_or_default():
     session = FakeSession(ok_checkin_routes("railgun.info"))
     await glados.run_account_checkin(
-        session, account(user_agent="LoginBrowserUA"), "FallbackUA", 7
+        session, account(user_agent="LoginBrowserUA"), 7
     )
     used = {kwargs["headers"]["user-agent"] for _, _, kwargs in session.requests}
     assert used == {"LoginBrowserUA"}
 
     session = FakeSession(ok_checkin_routes("railgun.info"))
-    await glados.run_account_checkin(session, account(), "FallbackUA", 7)
+    await glados.run_account_checkin(session, account(), 7)
     used = {kwargs["headers"]["user-agent"] for _, _, kwargs in session.requests}
-    assert used == {"FallbackUA"}
+    assert used == {glados.DEFAULT_USER_AGENT}
