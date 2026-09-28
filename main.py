@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -29,6 +29,20 @@ DEFAULT_USER_AGENT = (
 )
 PERMISSION_ERROR_HINTS = ("没有权限", "no permission")
 AUTOMATION_ERROR_HINTS = ("automated check-in detected",)
+DAILY_USAGE_DAYS = 7
+
+# Monthly traffic budget in GB per VIP tier, as computed by the GLaDOS
+# console itself. /api/user/traffic's "limit" field is NOT this budget.
+VIP_TRAFFIC_BUDGET_GB: dict[int, int] = {
+    51: 5000,  # Enterprise
+    41: 2000,  # Team
+    31: 500,  # Pro
+    21: 200,  # Basic
+    11: 50,  # Edu
+    10: 10,  # Free
+    0: 10,  # Free
+}
+WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 CODE_SUCCESS = 0
 CODE_REPEAT = 1
@@ -158,24 +172,17 @@ def load_accounts(raw_accounts: Any) -> list[GladosAccount]:
     return accounts
 
 
-def format_traffic(byte_count: int) -> str:
-    """Format a byte count as a human-readable binary-unit string.
+def format_gb(byte_count: int, decimals: int = 2) -> str:
+    """Format a byte count as decimal GB, matching the quota's unit.
 
     Args:
-        byte_count: Traffic in bytes as reported by /api/user/status.
+        byte_count: Traffic in bytes as reported by the GLaDOS APIs.
+        decimals: Fractional digits to keep.
 
     Returns:
-        E.g. ``"512 B"``, ``"1.5 KiB"``, ``"259.6 GiB"``.
+        E.g. ``"1.24 GB"``, ``"278.8 GB"``.
     """
-    units = ("B", "KiB", "MiB", "GiB", "TiB")
-    size = float(byte_count)
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(size)} {unit}"
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} TiB"
+    return f"{byte_count / 1e9:.{decimals}f} GB"
 
 
 def describe_site_error(code: Any, message: str) -> str:
@@ -411,6 +418,10 @@ async def query_account_status(
     port) and ``/api/user/points`` from the first domain that answers with
     a status payload. Read-only; never sends notifications.
 
+    Also renders the period traffic against the VIP-tier budget (the
+    console's own mapping) and a recent-days usage table from
+    ``/api/user/daily-usage``.
+
     Args:
         session: Shared aiohttp session.
         account: Account to query.
@@ -476,22 +487,87 @@ async def query_account_status(
                 exc_info=True,
             )
 
-        info = [f"剩余 {int(float(raw_days))} 天"]
-        if data.get("traffic") is not None:
-            info.append(f"已用流量 {format_traffic(int(data['traffic']))}")
-        if data.get("vip") is not None:
-            info.append(f"VIP {data['vip']}")
-        if data.get("region"):
-            info.append(f"区域 {data['region']}")
-        if data.get("port"):
-            info.append(f"端口 {data['port']}")
+        # Period usage counter; "today" is GLaDOS's field name but it holds
+        # the usage since the current cycle started, not today's traffic.
+        used_bytes = None
+        try:
+            traffic_data = await glados_request(
+                session,
+                "GET",
+                domain,
+                "/api/user/traffic",
+                account.cookie,
+                user_agent,
+                timeout,
+            )
+            if traffic_data.get("data", {}).get("today") is not None:
+                used_bytes = int(traffic_data["data"]["today"])
+        except (GladosApiError, TypeError, ValueError):
+            logger.warning(
+                "GLaDOS traffic query failed for account '%s' on %s",
+                account.name,
+                domain,
+                exc_info=True,
+            )
+
+        daily_section = ""
+        try:
+            daily_data = await glados_request(
+                session,
+                "GET",
+                domain,
+                "/api/user/daily-usage",
+                account.cookie,
+                user_agent,
+                timeout,
+            )
+            daily = daily_data.get("data", {}).get("dailyUsage") or []
+            total_bytes = daily_data.get("data", {}).get("totalBytes")
+            shown = daily[:DAILY_USAGE_DAYS]
+            if shown:
+                rows = []
+                for item in shown:
+                    day = datetime.fromtimestamp(
+                        int(item["time"]) / 1000, tz=timezone.utc
+                    )
+                    rows.append(
+                        f"  {day:%m-%d} {WEEKDAY_LABELS[day.weekday()]}"
+                        f"  {format_gb(int(item['bytes']))}"
+                    )
+                footer = f"  合计 {format_gb(sum(int(i['bytes']) for i in shown))}"
+                if total_bytes is not None:
+                    footer += f" · 近 {len(daily)} 天 {format_gb(int(total_bytes), 1)}"
+                daily_section = "\n".join(
+                    [f"近 {len(shown)} 天流量（UTC 日）：", *rows, footer]
+                )
+        except (GladosApiError, TypeError, ValueError):
+            logger.warning(
+                "GLaDOS daily usage query failed for account '%s' on %s",
+                account.name,
+                domain,
+                exc_info=True,
+            )
+
+        headline = [f"（{domain}）剩余 {int(float(raw_days))} 天"]
         if points is not None:
-            info.append(f"积分 {points}")
+            headline.append(f"积分 {points}")
+        lines = [" · ".join(headline)]
+        if used_bytes is not None:
+            budget = VIP_TRAFFIC_BUDGET_GB.get(data.get("vip"))
+            if budget:
+                percent = used_bytes / 1e9 / budget * 100
+                lines.append(
+                    f"流量 {used_bytes / 1e9:.1f}/{budget} GB（{percent:.1f}%）"
+                )
+            else:
+                lines.append(f"流量 {format_gb(used_bytes, 1)}")
+        if daily_section:
+            lines.append(daily_section)
         return AccountResult(
             name=account.name,
             ok=True,
             repeat=False,
-            detail=f"（{domain}）" + " · ".join(info),
+            detail="\n".join(lines),
         )
 
     return AccountResult(
