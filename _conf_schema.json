@@ -38,6 +38,12 @@
             "hint": "登录 glados.cloud 或 railgun.info 后复制的完整 Cookie，至少需要包含一个站点的一对会话字段。",
             "default": ""
           },
+          "user_agent": {
+            "description": "该账户的 User-Agent",
+            "type": "string",
+            "hint": "GLaDOS 会校验签到请求的平台与登录时浏览器的平台是否一致。请填写登录该账户所用浏览器控制台中 navigator.userAgent 的完整值；留空则使用通用配置的 User-Agent。",
+            "default": ""
+          },
           "success_umo": {
             "description": "签到成功通知 UMO",
             "type": "string",

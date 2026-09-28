@@ -48,6 +48,7 @@ def account(**overrides):
     fields = {
         "name": "test",
         "cookie": GLD_COOKIE,
+        "user_agent": "",
         "success_umo": "",
         "failure_umo": "",
         "sites": tuple(glados.complete_cookie_sites(GLD_COOKIE)),
@@ -92,12 +93,18 @@ def test_next_run_delay():
 def test_load_accounts_validates_and_defaults():
     accounts = glados.load_accounts(
         [
-            {"name": "main", "cookie": GLD_COOKIE},
+            {
+                "name": "main",
+                "cookie": GLD_COOKIE,
+                "user_agent": "MyAccountUA",
+            },
             {"cookie": BOTH_COOKIE},
         ]
     )
     assert [a.name for a in accounts] == ["main", "账户2"]
     assert accounts[0].sites == ("railgun.info",)
+    assert accounts[0].user_agent == "MyAccountUA"
+    assert accounts[1].user_agent == ""
     assert accounts[1].sites == glados.DOMAINS
 
     with pytest.raises(glados.GladosConfigError):
@@ -204,3 +211,18 @@ async def test_request_mirrors_browser_format():
     assert headers["content-type"] == "application/json;charset=UTF-8"
     assert kwargs["data"] == b'{"token":"railgun.info"}'
     assert "referer" not in headers
+
+
+@pytest.mark.asyncio
+async def test_account_user_agent_overrides_fallback():
+    session = FakeSession(ok_checkin_routes("railgun.info"))
+    await glados.run_account_checkin(
+        session, account(user_agent="LoginBrowserUA"), "FallbackUA", 7
+    )
+    used = {kwargs["headers"]["user-agent"] for _, _, kwargs in session.requests}
+    assert used == {"LoginBrowserUA"}
+
+    session = FakeSession(ok_checkin_routes("railgun.info"))
+    await glados.run_account_checkin(session, account(), "FallbackUA", 7)
+    used = {kwargs["headers"]["user-agent"] for _, _, kwargs in session.requests}
+    assert used == {"FallbackUA"}

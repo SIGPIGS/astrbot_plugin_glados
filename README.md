@@ -20,7 +20,7 @@ AstrBot 插件：每天定时执行 [GLaDOS](https://glados.cloud)（glados.clou
 | `user_agent` | 签到请求 User-Agent | macOS Chrome UA |
 | `request_timeout` | 单个请求超时（秒） | `30` |
 
-> GLaDOS 会比对「登录浏览器的平台」与「签到请求的平台」。若签到被判定为自动签到（code 4，"Automated check-in detected"），请在登录所用浏览器的控制台执行 `navigator.userAgent`，把完整值填到 `user_agent`。实测 Windows / Linux / iPhone UA 会被拦截，macOS UA 默认可用。
+> GLaDOS 会比对「登录浏览器的平台」与「签到请求的平台」。若签到被判定为自动签到（code 4，"Automated check-in detected"），请在登录所用浏览器的控制台执行 `navigator.userAgent`，把完整值填到对应账户的 `user_agent`（所有账户使用同一浏览器时，填在通用配置即可）。实测 Windows / Linux / iPhone UA 会被拦截，macOS UA 默认可用。
 
 ### 账户配置
 
@@ -30,8 +30,11 @@ AstrBot 插件：每天定时执行 [GLaDOS](https://glados.cloud)（glados.clou
 |---|---|
 | `name` | 账户备注名（用于通知与日志，缺省为「账户N」） |
 | `cookie` | 登录后从浏览器复制的完整 Cookie |
+| `user_agent` | 该账户的 User-Agent，留空使用通用配置（见下方说明） |
 | `success_umo` | 签到成功（含当日已签到）时通知的会话 UMO，留空不通知 |
 | `failure_umo` | 签到失败时通知的会话 UMO，留空不通知 |
+
+> **为什么每个账户要单独配置 `user_agent`**：GLaDOS 会校验「签到请求的平台」与「登录该账户时浏览器的平台」是否一致，不一致时签到会被拒绝（code 4，"Automated check-in detected"）。不同账户可能在不同设备/浏览器上登录，因此每个账户都应填写**登录时所用浏览器**控制台中 `navigator.userAgent` 的完整值；留空则回退到通用配置的 User-Agent（默认 macOS Chrome UA，实测 Windows / Linux / iPhone UA 会被拦截）。
 
 Cookie 说明：
 

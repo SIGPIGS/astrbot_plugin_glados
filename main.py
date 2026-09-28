@@ -51,6 +51,7 @@ class GladosAccount:
     Attributes:
         name: Display name used in notifications and logs.
         cookie: Raw Cookie header value copied from the browser.
+        user_agent: Per-account User-Agent (empty falls back to the global one).
         success_umo: UMO to notify on success (empty disables).
         failure_umo: UMO to notify on failure (empty disables).
         sites: Domains whose session-cookie keys are complete in ``cookie``.
@@ -58,6 +59,7 @@ class GladosAccount:
 
     name: str
     cookie: str
+    user_agent: str
     success_umo: str
     failure_umo: str
     sites: tuple[str, ...]
@@ -148,6 +150,7 @@ def load_accounts(raw_accounts: Any) -> list[GladosAccount]:
             GladosAccount(
                 name=name,
                 cookie=cookie,
+                user_agent=str(raw.get("user_agent") or "").strip(),
                 success_umo=str(raw.get("success_umo") or "").strip(),
                 failure_umo=str(raw.get("failure_umo") or "").strip(),
                 sites=sites,
@@ -168,7 +171,10 @@ def describe_site_error(code: Any, message: str) -> str:
     """
     lowered = (message or "").lower()
     if code == CODE_AUTOMATION or any(h in lowered for h in AUTOMATION_ERROR_HINTS):
-        return "被反自动化校验拦截（登录设备与 User-Agent 平台不一致）"
+        return (
+            "被反自动化校验拦截：登录该账户的浏览器平台与签到 User-Agent 不一致，"
+            "请在账户配置中把 user_agent 设为登录浏览器控制台的 navigator.userAgent"
+        )
     if code == CODE_FAILURE and any(h in lowered for h in PERMISSION_ERROR_HINTS):
         return "Cookie 无效、已过期或不属于该站点"
     return f"code {code}：{message or '无消息字段'}"
@@ -266,12 +272,15 @@ async def run_account_checkin(
     Args:
         session: Shared aiohttp session.
         account: Account to check in.
-        user_agent: User-Agent header value.
+        user_agent: Fallback User-Agent when the account has none.
         timeout: Per-request timeout in seconds.
 
     Returns:
         The account result used for logging and notifications.
     """
+    # GLaDOS compares the check-in request's UA platform with the browser
+    # the account was logged in from, so the UA must follow the account.
+    user_agent = account.user_agent or user_agent
     if not account.sites:
         return AccountResult(
             name=account.name,
